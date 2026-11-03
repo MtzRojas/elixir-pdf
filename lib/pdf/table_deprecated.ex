@@ -361,6 +361,13 @@ defmodule Pdf.TableDeprecated do
     {page, :complete} =
       page
       |> draw_background(lines, {x, y}, {width, row_height}, background(col_opts))
+      |> draw_highlights(
+        lines,
+        {x + pl, y + pb},
+        {width - pl - pr, row_height - pt - pb},
+        y + row_height - pt - offset,
+        col_opts
+      )
       |> Page.save_state()
       |> clip({x + pl, y + pb}, {width - pl - pr, row_height - pt - pb})
       |> Page.text_wrap(
@@ -387,6 +394,74 @@ defmodule Pdf.TableDeprecated do
     |> Page.set_fill_color(color)
     |> Page.fill()
     |> Page.restore_state()
+  end
+
+  # A chunk's :highlight goes behind its text, in its own q/Q: the text object
+  # that follows cannot hold paths, and must not inherit the highlight's colour.
+  defp draw_highlights(page, lines, {x, y}, {w, h}, top, col_opts) do
+    case highlight_boxes(lines, page.leading, x, w, top, col_opts) do
+      [] ->
+        page
+
+      boxes ->
+        clipped = page |> Page.save_state() |> clip({x, y}, {w, h})
+
+        boxes
+        |> Enum.reduce(clipped, fn {xy, wh, color}, page ->
+          page
+          |> Page.set_fill_color(color)
+          |> Page.rectangle(xy, wh)
+          |> Page.fill()
+        end)
+        |> Page.restore_state()
+    end
+  end
+
+  defp highlight_boxes([], _leading, _x, _w, _top, _col_opts), do: []
+
+  defp highlight_boxes([{:line, first} | _] = lines, leading, x, w, top, col_opts) do
+    baseline = top - (max_chunk_opt(first, :ascender) + max_chunk_opt(first, :line_gap))
+
+    {boxes, _position} =
+      Enum.flat_map_reduce(lines, {baseline, leading}, fn {:line, line}, {baseline, leading} ->
+        line_height = Keyword.get(col_opts, :leading, leading) || max_chunk_opt(line, :height)
+        {_text, _width, last} = List.last(line)
+
+        {line_boxes(line, line_x(line, x, w, col_opts), baseline),
+         {baseline - line_height, last[:leading]}}
+      end)
+
+    boxes
+  end
+
+  defp line_x(line, x, w, col_opts) do
+    line_width = Enum.reduce(line, 0, fn {_, width, _}, acc -> width + acc end)
+
+    case Keyword.get(col_opts, :align, :left) do
+      :left -> x
+      :center -> x + (w - line_width) / 2
+      :right -> x + (w - line_width)
+    end
+  end
+
+  defp line_boxes(line, x, baseline) do
+    line
+    |> Enum.chunk_by(fn {_, _, opts} -> {opts[:highlight], opts[:font], opts[:font_size]} end)
+    |> Enum.map_reduce(x, fn [{_, _, opts} | _] = run, x ->
+      width = Enum.reduce(run, 0, fn {_, width, _}, acc -> width + acc end)
+      {{x, width, opts}, x + width}
+    end)
+    |> elem(0)
+    |> Enum.filter(fn {_x, width, opts} -> opts[:highlight] && width > 0 end)
+    |> Enum.map(fn {x, width, opts} ->
+      size = opts[:font_size]
+      bottom = baseline + opts[:ascender] + opts[:line_gap] - size
+      {{x, bottom}, {width, size}, opts[:highlight]}
+    end)
+  end
+
+  defp max_chunk_opt(line, key) do
+    line |> Enum.map(fn {_, _, opts} -> Keyword.get(opts, key) end) |> Enum.max()
   end
 
   defp clip(page, {x, y}, {w, h}) do
