@@ -298,4 +298,105 @@ defmodule Pdf.TableDeprecatedTest do
       _ -> String.to_float(string)
     end
   end
+
+  describe "chunk :highlight" do
+    @yellow "1.0 1.0 0.0 rg"
+
+    defp highlighted_table(page, data, opts \\ []) do
+      {page, :complete} =
+        page
+        |> Page.set_font("Helvetica", 12)
+        |> Page.table({20, 600}, {300, 500}, data, opts)
+
+      export(page)
+    end
+
+    defp boxes(output) do
+      ~r/^(-?[\d.]+) (-?[\d.]+) (-?[\d.]+) (-?[\d.]+) re\nf$/m
+      |> Regex.scan(output, capture: :all_but_first)
+      |> Enum.map(fn numbers -> Enum.map(numbers, &(&1 |> Float.parse() |> elem(0))) end)
+    end
+
+    defp baselines(output) do
+      ~r/^(-?[\d.]+) (-?[\d.]+) Td$/m
+      |> Regex.scan(output, capture: :all_but_first)
+      |> Enum.map(fn [_x, y] -> y |> Float.parse() |> elem(0) end)
+    end
+
+    defp colour_of(output, text) do
+      output
+      |> String.split("\n")
+      |> Enum.reduce_while({"black", []}, fn line, {colour, saved} ->
+        cond do
+          line == "q" -> {:cont, {colour, [colour | saved]}}
+          line == "Q" -> {:cont, {hd(saved), tl(saved)}}
+          String.ends_with?(line, " rg") -> {:cont, {line, saved}}
+          String.contains?(line, text) and String.ends_with?(line, "Tj") -> {:halt, colour}
+          true -> {:cont, {colour, saved}}
+        end
+      end)
+    end
+
+    test "paints only the highlighted chunk, before the text", %{page: page} do
+      output =
+        highlighted_table(page, [[[{"Marked", [highlight: {255, 255, 0}]}, {" plain", []}]]])
+
+      assert [[20.0, 588.0, width, 12.0]] = boxes(output)
+      assert_in_delta width, 40.008, 0.001
+
+      [before_text, _text] = String.split(output, "BT", parts: 2)
+      assert before_text =~ @yellow
+    end
+
+    test "the text keeps its own colour", %{page: page} do
+      output =
+        highlighted_table(page, [
+          [[{"Marked", [highlight: {255, 255, 0}]}], [{"Other", [color: {255, 0, 0}]}]]
+        ])
+
+      refute colour_of(output, "Marked") == @yellow
+      assert colour_of(output, "Other") == "1.0 0.0 0.0 rg"
+    end
+
+    test "follows the alignment of its line", %{page: page} do
+      output =
+        highlighted_table(page, [[[{"Marked", [highlight: {255, 255, 0}]}]]],
+          cols: [[align: :right]]
+        )
+
+      assert [[x, _y, width, _h]] = boxes(output)
+      assert_in_delta x + width, 320.0, 0.01
+    end
+
+    test "each wrapped line gets its own box at its own baseline", %{page: page} do
+      words = String.duplicate("marked ", 30) |> String.trim()
+      output = highlighted_table(page, [[[{words, [highlight: {255, 255, 0}]}]]])
+
+      box_ys = output |> boxes() |> Enum.map(fn [_x, y, _w, _h] -> y end)
+      [first | moves] = baselines(output)
+
+      expected =
+        moves
+        |> Enum.scan(first, &(&1 + &2))
+        |> then(&[first | &1])
+        |> Enum.map(&(&1 + 8.616 + 0.45 - 12))
+
+      assert length(box_ys) > 1
+      assert length(box_ys) == length(expected)
+
+      for {box_y, line_y} <- Enum.zip(box_ys, expected), do: assert_in_delta(box_y, line_y, 0.01)
+    end
+
+    test "is clipped to the cell", %{page: page} do
+      output =
+        highlighted_table(page, [[[{"Marked", [highlight: {255, 255, 0}]}]]], padding: {2, 4})
+
+      assert output =~ ~r/^24 586 292\.0 12 re\nW n\n#{@yellow}$/m
+    end
+
+    test "a table without highlights draws nothing extra", %{page: page} do
+      plain = highlighted_table(page, [[[{"Marked", []}]]])
+      assert boxes(plain) == []
+    end
+  end
 end
